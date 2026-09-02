@@ -8,6 +8,17 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 # Prevent runtime AutoUpdate which blocked container startup for 278 seconds
 os.environ["YOLO_AUTOUPDATE"] = "0"
 os.environ["YOLO_VERBOSE"] = "False"
+# Disable experimental Node.js SSR in Gradio
+os.environ["GRADIO_SSR_MODE"] = "False"
+
+# Hugging Face ZeroGPU compatibility anchor
+try:
+    import spaces
+    @spaces.GPU
+    def zero_gpu_anchor():
+        return True
+except Exception:
+    pass
 
 import threading
 
@@ -431,7 +442,7 @@ def demo_interface():
 try:
     import gradio as gr
 
-    with gr.Blocks(title="Marine Debris & Sonar Anomaly Survey") as demo:
+    with gr.Blocks(title="Marine Debris & Sonar Anomaly Survey", ssr_mode=False) as demo:
         gr.HTML('<iframe src="/demo" style="width:100%; height:94vh; border:none; border-radius:12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);"></iframe>')
 
     # Attach all FastAPI routes (/detect, /report, /demo, /docs) to Gradio's app
