@@ -31,8 +31,12 @@ def _load_env_file():
 
 _load_env_file()
 
-# ---- CONFIG ----
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "best.pt") if os.path.exists(os.path.join(os.path.dirname(__file__), "best.pt")) else "best.pt"
+# Prefer ultra-fast compiled ONNX model over PyTorch weights
+ONNX_PATH = os.path.join(os.path.dirname(__file__), "best.onnx")
+PT_PATH = os.path.join(os.path.dirname(__file__), "best.pt")
+MODEL_PATH = ONNX_PATH if os.path.exists(ONNX_PATH) else (PT_PATH if os.path.exists(PT_PATH) else "best.onnx")
+
+INFERENCE_SIZE = 416
 CONFIDENCE_THRESHOLD = 0.5
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
@@ -44,8 +48,8 @@ CONSUMER_PLASTICS_WASTE = {"Bottle", "Can", "Drink-carton", "Shampoo-bottle", "S
 # ---- SETUP ----
 app = FastAPI(
     title="Marine Debris & Sonar Anomaly Detection API",
-    description="Acoustic sonar object detection (YOLOv8) and AI-powered survey analysis (Gemini)",
-    version="2.0.0"
+    description="Acoustic sonar object detection (YOLOv8 ONNX) and AI-powered survey analysis (Gemini)",
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -55,7 +59,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load YOLO model
+# Load YOLO model (supports both .onnx and .pt)
 model = YOLO(MODEL_PATH)
 
 import torch
@@ -80,11 +84,11 @@ else:
 
 @app.on_event("startup")
 def warmup():
-    """Pre-warms YOLO model so the first user request is not delayed by PyTorch cold-start."""
+    """Pre-warms YOLO model so the first user request is not delayed by cold-start."""
     try:
         import numpy as np
-        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
-        model.predict(dummy, imgsz=640, verbose=False)
+        dummy = np.zeros((INFERENCE_SIZE, INFERENCE_SIZE, 3), dtype=np.uint8)
+        model.predict(dummy, imgsz=INFERENCE_SIZE, device="cpu", verbose=False)
     except Exception:
         pass
 
@@ -94,7 +98,9 @@ def root():
     return {
         "status": "ok",
         "service": "Marine Debris & Sonar Anomaly Detection API",
-        "version": "2.0.0",
+        "version": "2.1.0",
+        "model_format": "ONNX" if MODEL_PATH.endswith(".onnx") else "PyTorch",
+        "inference_size": INFERENCE_SIZE,
         "gemini_configured": gemini_model is not None,
         "docs_url": "/docs",
         "demo_url": "/demo"
@@ -105,10 +111,10 @@ def root():
 # ENDPOINT 1: /detect
 # ---------------------------------------------------------------------------
 @app.post("/detect")
-async def detect(file: UploadFile = File(...)):
+async def detect(file: UploadFile = File(...), include_annotated: bool = True):
     """
-    Accepts an uploaded sonar image, runs YOLOv8 detection, returns raw detections
-    and an annotated image.
+    Accepts an uploaded sonar image, runs YOLOv8 detection at 416px, returns raw detections
+    and an optional annotated image.
     """
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
@@ -119,8 +125,8 @@ async def detect(file: UploadFile = File(...)):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image format")
 
-    # Use imgsz=640 for fast inference on low-CPU environments
-    results = model.predict(image, conf=CONFIDENCE_THRESHOLD, imgsz=640, verbose=False)
+    # Fast inference at 416px on CPU (ONNX optimized)
+    results = model.predict(image, conf=CONFIDENCE_THRESHOLD, imgsz=INFERENCE_SIZE, device="cpu", verbose=False)
     result = results[0]
 
     detections = []
@@ -142,20 +148,22 @@ async def detect(file: UploadFile = File(...)):
             "area_percentage": area_pct
         })
 
-    # Generate annotated image (bounding boxes and labels drawn) as optimized base64 JPEG
-    annotated_array = result.plot()
-    annotated_image = Image.fromarray(annotated_array[..., ::-1])
+    annotated_data_url = None
+    if include_annotated:
+        # Generate annotated image only if requested (saving CPU and network overhead)
+        annotated_array = result.plot()
+        annotated_image = Image.fromarray(annotated_array[..., ::-1])
 
-    # Downscale annotated preview if larger than 900px to speed up network payload on free tier
-    if annotated_image.width > 900:
-        ratio = 900.0 / annotated_image.width
-        new_size = (900, int(annotated_image.height * ratio))
-        annotated_image = annotated_image.resize(new_size, Image.Resampling.BILINEAR)
+        # Downscale annotated preview if larger than 800px
+        if annotated_image.width > 800:
+            ratio = 800.0 / annotated_image.width
+            new_size = (800, int(annotated_image.height * ratio))
+            annotated_image = annotated_image.resize(new_size, Image.Resampling.BILINEAR)
 
-    buffer = io.BytesIO()
-    annotated_image.save(buffer, format="JPEG", quality=80, optimize=True)
-    annotated_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    annotated_data_url = f"data:image/jpeg;base64,{annotated_base64}"
+        buffer = io.BytesIO()
+        annotated_image.save(buffer, format="JPEG", quality=75, optimize=True)
+        annotated_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        annotated_data_url = f"data:image/jpeg;base64,{annotated_base64}"
 
     return {
         "detections": detections,

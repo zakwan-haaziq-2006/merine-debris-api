@@ -524,7 +524,8 @@
         </button>
 
         <div class="preview-container" id="previewBox">
-          <div class="preview-placeholder">Awaiting sonar image upload...</div>
+          <canvas id="previewCanvas" style="display: none; width: 100%; height: auto;"></canvas>
+          <div class="preview-placeholder" id="previewPlaceholder">Awaiting sonar image upload...</div>
         </div>
 
         <div id="detectionPills" class="pill-list"></div>
@@ -580,6 +581,7 @@
 
   <script>
     let selectedFile = null;
+    let sourceImage = null;
     let latestDetections = [];
     let latestReportMarkdown = "";
 
@@ -612,8 +614,81 @@
     }
 
     function onFileLoaded() {
+      if (!selectedFile) return;
       document.getElementById('scanBtn').disabled = false;
       dropzone.querySelector('p strong').innerText = selectedFile.name;
+
+      // Draw local image immediately onto canvas
+      const img = new Image();
+      img.onload = () => {
+        sourceImage = img;
+        const canvas = document.getElementById('previewCanvas');
+        const placeholder = document.getElementById('previewPlaceholder');
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        canvas.style.display = 'block';
+        placeholder.style.display = 'none';
+      };
+      img.src = URL.createObjectURL(selectedFile);
+    }
+
+    function renderBoundingBoxes(detections) {
+      if (!sourceImage) return;
+      const canvas = document.getElementById('previewCanvas');
+      const ctx = canvas.getContext('2d');
+
+      // Redraw pristine source frame
+      ctx.drawImage(sourceImage, 0, 0);
+
+      if (!detections || detections.length === 0) return;
+
+      const scale = Math.max(1, canvas.width / 900);
+      const fontSize = Math.max(12, Math.round(14 * scale));
+      ctx.font = `bold ${fontSize}px 'JetBrains Mono', monospace`;
+
+      const getCategoryTheme = (cls) => {
+        const lower = cls.toLowerCase();
+        if (['human', 'aircraft', 'ship'].includes(lower)) {
+          return { stroke: '#ff3366', fill: 'rgba(255, 51, 102, 0.22)', text: '#ffffff' };
+        }
+        if (['chain', 'hook', 'propeller', 'valve'].includes(lower)) {
+          return { stroke: '#ffb703', fill: 'rgba(255, 183, 3, 0.22)', text: '#050b14' };
+        }
+        return { stroke: '#00f0ff', fill: 'rgba(0, 240, 255, 0.20)', text: '#050b14' };
+      };
+
+      detections.forEach(d => {
+        const { x1, y1, x2, y2 } = d.box;
+        const w = x2 - x1;
+        const h = y2 - y1;
+        const theme = getCategoryTheme(d.class);
+
+        // Semi-transparent target fill
+        ctx.fillStyle = theme.fill;
+        ctx.fillRect(x1, y1, w, h);
+
+        // Neon bounding border
+        ctx.strokeStyle = theme.stroke;
+        ctx.lineWidth = Math.max(2, Math.round(2.5 * scale));
+        ctx.strokeRect(x1, y1, w, h);
+
+        // High-contrast label tag
+        const label = `${d.class} ${Math.round(d.confidence * 100)}%`;
+        const textMetrics = ctx.measureText(label);
+        const padX = 6 * scale;
+        const padY = 4 * scale;
+        const badgeW = textMetrics.width + (padX * 2);
+        const badgeH = fontSize + (padY * 2);
+        const badgeY = Math.max(0, y1 - badgeH);
+
+        ctx.fillStyle = theme.stroke;
+        ctx.fillRect(x1, badgeY, badgeW, badgeH);
+
+        ctx.fillStyle = theme.text;
+        ctx.fillText(label, x1 + padX, badgeY + badgeH - padY);
+      });
     }
 
     // Step 1: Detect
@@ -628,7 +703,8 @@
       formData.append("file", selectedFile);
 
       try {
-        const res = await fetch("/detect", {
+        // Request pure detections without server-side JPEG rendering overhead
+        const res = await fetch("/detect?include_annotated=false", {
           method: "POST",
           body: formData
         });
@@ -638,9 +714,8 @@
 
         latestDetections = data.detections || [];
 
-        // Render annotated image
-        const previewBox = document.getElementById('previewBox');
-        previewBox.innerHTML = `<img src="${data.annotated_image}" alt="Sonar Detections" />`;
+        // Instant client-side canvas render
+        renderBoundingBoxes(latestDetections);
 
         // Render detection pills
         const pillList = document.getElementById('detectionPills');
@@ -648,7 +723,7 @@
           `<span class="pill">${d.class} (${Math.round(d.confidence * 100)}%)</span>`
         ).join('') || '<span class="pill">No targets identified</span>';
 
-        // Re-enable scan button immediately so user sees detection completed right away
+        // Re-enable scan button immediately
         scanBtn.disabled = false;
         scanBtn.innerHTML = '<span>Run Acoustic Detection</span>';
 
