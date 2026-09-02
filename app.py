@@ -80,9 +80,11 @@ from langchain_core.output_parsers import StrOutputParser
 
 if GEMINI_API_KEY:
     langchain_llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+        model="gemini-3.6-flash",
         google_api_key=GEMINI_API_KEY,
-        max_output_tokens=800
+        max_output_tokens=800,
+        max_retries=0,
+        timeout=10
     )
 else:
     langchain_llm = None
@@ -108,7 +110,7 @@ def root():
         "version": "2.1.0",
         "model_format": "ONNX" if MODEL_PATH.endswith(".onnx") else "PyTorch",
         "inference_size": INFERENCE_SIZE,
-        "gemini_configured": gemini_model is not None,
+        "gemini_configured": langchain_llm is not None,
         "docs_url": "/docs",
         "demo_url": "/demo"
     }
@@ -243,14 +245,8 @@ def _aggregate_survey_telemetry(detections: list):
 async def generate_report(request: ReportRequest):
     """
     Takes detection telemetry from /detect and generates an elaborated,
-    highly accurate, professional maritime survey report using Gemini.
+    highly accurate, professional maritime survey report using Gemini / LangChain.
     """
-    if gemini_model is None:
-        raise HTTPException(
-            status_code=500,
-            detail="GEMINI_API_KEY is not configured. Set the GEMINI_API_KEY environment variable or populate app/.env"
-        )
-
     telemetry = _aggregate_survey_telemetry(request.detections)
     location_text = request.location_note or "General Coastal Survey Zone"
     meta_info = request.metadata or SurveyMetadata()
@@ -334,17 +330,45 @@ Provide a numbered, prioritized action protocol for port authorities, coast guar
 
 Keep the tone rigorous, technical, concise, and actionable (maximum 350-400 words total). Do NOT generate conversational filler or introductory greetings."""
 
-    if langchain_llm is None:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured.")
+    report_markdown = None
 
-    prompt_template = PromptTemplate.from_template("{prompt_text}")
-    chain = prompt_template | langchain_llm | StrOutputParser()
+    # Attempt LangChain Gemini generation if configured
+    if langchain_llm is not None:
+        try:
+            prompt_template = PromptTemplate.from_template("{prompt_text}")
+            chain = prompt_template | langchain_llm | StrOutputParser()
+            res = await chain.ainvoke({"prompt_text": prompt})
+            if res and res.strip():
+                report_markdown = res.strip()
+        except Exception as e:
+            # When Gemini hits quota (429) or is unreachable, gracefully fall back to telemetry report
+            print(f"[WARN] Gemini report generation failed ({e}). Using telemetry-based acoustic survey report.")
 
-    try:
-        report_markdown = await chain.ainvoke({"prompt_text": prompt})
-        report_markdown = report_markdown.strip()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LangChain Gemini generation error: {str(e)}")
+    # High-reliability fallback report (ensures /report NEVER crashes with 500 error)
+    if not report_markdown:
+        report_markdown = f"""# Marine Sonar Survey & Environmental Hazard Assessment
+**Sector**: {location_text} | **Sensor**: {meta_info.sensor_type}  
+**Assessment Risk Level**: [{telemetry["risk_level"]}]
+
+## 1. Executive Summary
+Acoustic sonar survey across {location_text} identified a total of {telemetry["total_detections"]} target return(s) with an average acoustic confidence of {int(telemetry["avg_confidence"] * 100)}%. Preliminary hazard rating is classified as {telemetry["risk_level"]} due to {telemetry["primary_hazard"]}.
+
+## 2. Acoustic Target Inventory & Classification
+Target breakdown:
+{detections_summary}
+
+- **Critical Maritime Anomalies**: {telemetry["categories"]["critical_anomalies"]} target(s) logged.
+- **Subsea Rigging & Hardware**: {telemetry["categories"]["subsea_hardware"]} target(s) logged.
+- **Anthropogenic Waste & Polymers**: {telemetry["categories"]["plastics_and_debris"]} target(s) logged.
+
+## 3. Threat Assessment & Navigational Impact
+- **Primary Hazard**: {telemetry["primary_hazard"]}
+- **Navigational Impact**: Subsea debris poses entanglement and snag risks to vessel propulsion systems, commercial nets, and underwater infrastructure. Immediate caution advised for local maritime traffic.
+
+## 4. Operational Remediation & Action Protocol
+1. Transmit acoustic hazard bulletin to harbor master and coastal patrol ({location_text}).
+2. Deploy Remotely Operated Vehicle (ROV) for optical inspection and target coordinates confirmation.
+3. Schedule targeted mechanical recovery operations for identified heavy subsea targets."""
 
     # Extract 2-line executive summary from the markdown text
     summary_match = re.search(r"## 1\. Executive Summary\s+([^\n#]+)", report_markdown)
