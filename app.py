@@ -1,0 +1,373 @@
+import os
+import io
+import base64
+import json
+import re
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from ultralytics import YOLO
+from PIL import Image
+import google.generativeai as genai
+
+# ---- AUTO-LOAD .ENV IF PRESENT ----
+def _load_env_file():
+    for candidate in [".env", "app/.env", os.path.join(os.path.dirname(__file__), ".env")]:
+        if os.path.exists(candidate):
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip("'\"")
+                            if k and k not in os.environ:
+                                os.environ[k] = v
+            except Exception:
+                pass
+
+_load_env_file()
+
+# ---- CONFIG ----
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "best.pt") if os.path.exists(os.path.join(os.path.dirname(__file__), "best.pt")) else "best.pt"
+CONFIDENCE_THRESHOLD = 0.5
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# Domain classification categories for the 13 sonar classes
+CRITICAL_ANOMALIES = {"human", "aircraft", "ship"}
+HARDWARE_AND_RIGGING = {"Chain", "Hook", "Propeller", "Valve"}
+CONSUMER_PLASTICS_WASTE = {"Bottle", "Can", "Drink-carton", "Shampoo-bottle", "Standing-bottle", "Tire"}
+
+# ---- SETUP ----
+app = FastAPI(
+    title="Marine Debris & Sonar Anomaly Detection API",
+    description="Acoustic sonar object detection (YOLOv8) and AI-powered survey analysis (Gemini)",
+    version="2.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Load YOLO model
+model = YOLO(MODEL_PATH)
+
+# Supported generation models
+ACTIVE_GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-flash-latest"]
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY, transport="rest")
+    gemini_model = genai.GenerativeModel("gemini-3.6-flash")
+else:
+    gemini_model = None
+
+
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": "Marine Debris & Sonar Anomaly Detection API",
+        "version": "2.0.0",
+        "gemini_configured": gemini_model is not None,
+        "docs_url": "/docs",
+        "demo_url": "/demo"
+    }
+
+
+# ---------------------------------------------------------------------------
+# ENDPOINT 1: /detect
+# ---------------------------------------------------------------------------
+@app.post("/detect")
+async def detect(file: UploadFile = File(...)):
+    """
+    Accepts an uploaded sonar image, runs YOLOv8 detection, returns raw detections
+    and an annotated image.
+    """
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    contents = await file.read()
+    try:
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image format")
+
+    results = model.predict(image, conf=CONFIDENCE_THRESHOLD, verbose=False)
+    result = results[0]
+
+    detections = []
+    for box in result.boxes:
+        cls_id = int(box.cls[0])
+        cls_name = model.names[cls_id]
+        confidence = float(box.conf[0])
+        x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
+        
+        # Calculate relative bounding box area percentage
+        box_area = (x2 - x1) * (y2 - y1)
+        total_area = image.width * image.height
+        area_pct = round((box_area / total_area) * 100, 2) if total_area > 0 else 0
+
+        detections.append({
+            "class": cls_name,
+            "confidence": round(confidence, 3),
+            "box": {"x1": round(x1, 1), "y1": round(y1, 1), "x2": round(x2, 1), "y2": round(y2, 1)},
+            "area_percentage": area_pct
+        })
+
+    # Generate annotated image (bounding boxes and labels drawn) as base64 JPEG
+    annotated_array = result.plot()
+    annotated_image = Image.fromarray(annotated_array[..., ::-1])
+
+    buffer = io.BytesIO()
+    annotated_image.save(buffer, format="JPEG", quality=90)
+    annotated_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    annotated_data_url = f"data:image/jpeg;base64,{annotated_base64}"
+
+    return {
+        "detections": detections,
+        "image_width": image.width,
+        "image_height": image.height,
+        "total_detected": len(detections),
+        "annotated_image": annotated_data_url
+    }
+
+
+# ---------------------------------------------------------------------------
+# ENDPOINT 2: /report
+# ---------------------------------------------------------------------------
+class SurveyMetadata(BaseModel):
+    survey_id: str | None = None
+    water_depth_m: float | None = None
+    sensor_type: str | None = "Forward-Looking Sonar (FLS)"
+    coordinates: str | None = None
+
+
+class ReportRequest(BaseModel):
+    detections: list
+    location_note: str | None = None
+    metadata: SurveyMetadata | None = None
+
+
+def _aggregate_survey_telemetry(detections: list):
+    """Computes statistical and domain distribution metrics from raw detections."""
+    total = len(detections)
+    if total == 0:
+        return None
+
+    class_counts = {}
+    confidences = []
+    anomalies_count = 0
+    hardware_count = 0
+    plastics_count = 0
+
+    for d in detections:
+        cls = d.get("class", "Unknown")
+        conf = float(d.get("confidence", 0.0))
+        class_counts[cls] = class_counts.get(cls, 0) + 1
+        confidences.append(conf)
+
+        if cls in CRITICAL_ANOMALIES:
+            anomalies_count += 1
+        elif cls in HARDWARE_AND_RIGGING:
+            hardware_count += 1
+        elif cls in CONSUMER_PLASTICS_WASTE:
+            plastics_count += 1
+
+    avg_conf = round(sum(confidences) / total, 3) if confidences else 0.0
+
+    # Determine baseline risk classification
+    if "human" in class_counts:
+        risk_level = "CRITICAL"
+        primary_hazard = "Human / Diver in Distress (Immediate SAR Protocol)"
+    elif any(c in class_counts for c in ["aircraft", "ship"]):
+        risk_level = "CRITICAL"
+        primary_hazard = "Submerged Vessel/Aviation Wreckage & Navigational Obstruction"
+    elif hardware_count > 0:
+        risk_level = "HIGH" if hardware_count >= 2 else "MEDIUM"
+        primary_hazard = "Subsea Rigging / Heavy Hardware Entanglement & Vessel Snag Hazard"
+    elif plastics_count > 4:
+        risk_level = "MEDIUM"
+        primary_hazard = "High-Density Anthropogenic Debris Field & Benthic Plastic Smothering"
+    else:
+        risk_level = "LOW"
+        primary_hazard = "Isolated Anthropogenic Waste"
+
+    return {
+        "total_detections": total,
+        "class_counts": class_counts,
+        "avg_confidence": avg_conf,
+        "risk_level": risk_level,
+        "primary_hazard": primary_hazard,
+        "categories": {
+            "critical_anomalies": anomalies_count,
+            "subsea_hardware": hardware_count,
+            "plastics_and_debris": plastics_count
+        }
+    }
+
+
+@app.post("/report")
+async def generate_report(request: ReportRequest):
+    """
+    Takes detection telemetry from /detect and generates an elaborated,
+    highly accurate, professional maritime survey report using Gemini.
+    """
+    if gemini_model is None:
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY is not configured. Set the GEMINI_API_KEY environment variable or populate app/.env"
+        )
+
+    telemetry = _aggregate_survey_telemetry(request.detections)
+    location_text = request.location_note or "General Coastal Survey Zone"
+    meta_info = request.metadata or SurveyMetadata()
+
+    if not telemetry:
+        clean_report = f"""# Acoustic Sonar Survey Report
+**Location**: {location_text}  
+**Status**: CLEAR / NO TARGETS DETECTED  
+**Threat Level**: LOW  
+
+### 1. Survey Overview
+Acoustic inspection of the specified survey sector returned zero high-confidence debris targets or seabed anomalies. 
+
+### 2. Acoustic Analysis
+The seabed profile shows continuous natural acoustic backscatter without man-made acoustic shadows, metallic reflections, or synthetic debris silhouettes.
+
+### 3. Conclusion & Recommendation
+No navigational or environmental hazards detected. Normal maritime transit and benthic habitat operations may continue without intervention."""
+        return {
+            "report": clean_report,
+            "report_markdown": clean_report,
+            "risk_level": "LOW",
+            "summary": "Survey clear: No marine debris or acoustic anomalies detected.",
+            "primary_hazard": "None",
+            "statistics": {
+                "total_detections": 0,
+                "avg_confidence": 1.0,
+                "categories": {"critical_anomalies": 0, "subsea_hardware": 0, "plastics_and_debris": 0}
+            },
+            "priority_actions": ["Log sector as clear in maritime registry", "Proceed with routine monitoring schedule"]
+        }
+
+    # Format telemetry breakdown for Gemini prompt
+    item_lines = [
+        f"  - {count}x '{cls}'"
+        for cls, count in telemetry["class_counts"].items()
+    ]
+    detections_summary = "\n".join(item_lines)
+
+    # Elaborated domain prompt
+    prompt = f"""You are a Lead Marine Acoustic Surveyor and Oceanographic Environmental Officer conducting subsea survey evaluations using Forward-Looking Sonar (FLS) imagery.
+
+Provide an elaborated, technically accurate, and highly professional Marine Survey & Hazard Assessment Report based strictly on the verified acoustic detections below.
+
+=== MISSION & SENSOR TELEMETRY ===
+- Location/Sector: {location_text}
+- Sensor Type: {meta_info.sensor_type}
+- Total Detected Objects: {telemetry["total_detections"]}
+- Average Acoustic Confidence: {int(telemetry["avg_confidence"] * 100)}%
+- Target Breakdown:
+{detections_summary}
+- Categorical Distribution:
+  * High-Consequence Anomalies: {telemetry["categories"]["critical_anomalies"]}
+  * Subsea Rigging / Hardware: {telemetry["categories"]["subsea_hardware"]}
+  * Synthetic Polymers & General Waste: {telemetry["categories"]["plastics_and_debris"]}
+- Preliminary Baseline Risk Rating: {telemetry["risk_level"]} ({telemetry["primary_hazard"]})
+
+=== REPORT REQUIREMENTS ===
+Generate a comprehensive, structured technical survey document in professional GitHub-Flavored Markdown. 
+Structure the report into the following exact sections:
+
+# Marine Sonar Survey & Environmental Hazard Assessment
+**Sector**: {location_text} | **Sensor**: {meta_info.sensor_type}  
+**Assessment Risk Level**: [{telemetry["risk_level"]}]
+
+## 1. Executive Summary
+Provide an authoritative 2-3 paragraph operational synthesis. Summarize the acoustic scan, describe the concentration and nature of target returns, and state the immediate operational posture required.
+
+## 2. Acoustic Target Inventory & Classification
+Break down the detections by domain category:
+- **Maritime Anomalies & Structural Wreckage** (e.g. aircraft, ship, human): Discuss dimensions, structural integrity, potential historical/salvage significance, or urgent SAR (Search and Rescue) considerations.
+- **Subsea Machinery & Heavy Hardware** (e.g. chain, propeller, hook, valve): Discuss snag/entanglement hazards to submarine cables, commercial bottom-trawling nets, and vessel propulsion systems.
+- **Anthropogenic Debris & Polymers** (e.g. tires, bottles, cartons, cans): Assess benthic smothering, chemical leaching, microplastic degradation timelines, and marine fauna toxicity.
+
+## 3. Threat Assessment & Navigational Impact
+- **Hydrodynamic & Navigational Risks**: Evaluate water column clearance, shallow hazards to shallow-draft vessels, diver safety, and ROV navigation.
+- **Ecosystem & Benthic Toxicity**: Detail the ecological fallout if targets remain unrecovered.
+
+## 4. Operational Remediation & Action Protocol
+Provide a numbered, prioritized action protocol for port authorities, coast guard, or salvage teams (e.g. Priority Level 1 immediate notices to mariners, ROV deployment, diver dispatch, targeted recovery crane operations).
+
+Keep the tone rigorous, technical, and actionable. Do NOT generate conversational filler or introductory greetings."""
+
+    response = None
+    last_err = None
+    for model_name in ACTIVE_GEMINI_MODELS:
+        try:
+            m = genai.GenerativeModel(model_name)
+            response = m.generate_content(prompt)
+            if response and response.text:
+                break
+        except Exception as e:
+            last_err = e
+            continue
+
+    if response is None or not response.text:
+        raise HTTPException(status_code=500, detail=f"Gemini generation error: {str(last_err)}")
+
+    report_markdown = response.text.strip()
+
+    # Extract 2-line executive summary from the markdown text
+    summary_match = re.search(r"## 1\. Executive Summary\s+([^\n#]+)", report_markdown)
+    exec_summary = summary_match.group(1).strip() if summary_match else f"Identified {telemetry['total_detections']} objects across survey sector {location_text} with baseline risk rating {telemetry['risk_level']}."
+
+    # Extract priority actions if available
+    actions = []
+    actions_section = re.search(r"## 4\. Operational Remediation & Action Protocol\s+([\s\S]*?)(?:$|#)", report_markdown)
+    if actions_section:
+        raw_actions = re.findall(r"(?:^|\n)\s*(?:\d+\.|\-|\*)\s*(.+)", actions_section.group(1))
+        actions = [a.strip() for a in raw_actions[:5] if a.strip()]
+    if not actions:
+        actions = [
+            f"Transmit hazard bulletin to local harbor master and coastal patrol ({location_text})",
+            "Deploy Remotely Operated Vehicle (ROV) for high-resolution visual confirmation",
+            "Schedule mechanical salvage operation for heavy entanglement risks"
+        ]
+
+    return {
+        # Backward compatibility field:
+        "report": report_markdown,
+        
+        # Enriched structured fields:
+        "report_markdown": report_markdown,
+        "risk_level": telemetry["risk_level"],
+        "summary": exec_summary,
+        "primary_hazard": telemetry["primary_hazard"],
+        "statistics": {
+            "total_detections": telemetry["total_detections"],
+            "avg_confidence": telemetry["avg_confidence"],
+            "class_counts": telemetry["class_counts"],
+            "categories": telemetry["categories"]
+        },
+        "priority_actions": actions
+    }
+
+
+# ---------------------------------------------------------------------------
+# INTERACTIVE DEMO / TEST UI (for frontend preview and verification)
+# ---------------------------------------------------------------------------
+@app.get("/demo", response_class=HTMLResponse)
+def demo_interface():
+    """Provides a built-in modern dashboard to test /detect and /report interactively."""
+    html_file = os.path.join(os.path.dirname(__file__), "demo.html")
+    if os.path.exists(html_file):
+        with open(html_file, "r", encoding="utf-8") as f:
+            return f.read()
+    return "<h1>Demo dashboard template not found</h1>"

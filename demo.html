@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sonar Debris & Anomaly Survey Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    :root {
+      --bg: #070d18;
+      --card-bg: rgba(14, 25, 44, 0.75);
+      --card-border: rgba(45, 114, 210, 0.22);
+      --card-hover: rgba(45, 114, 210, 0.35);
+      --accent: #00e5ff;
+      --accent-glow: rgba(0, 229, 255, 0.3);
+      --text-main: #f0f6fc;
+      --text-muted: #8b9bb4;
+      --risk-low: #00e676;
+      --risk-med: #ffb300;
+      --risk-high: #ff5722;
+      --risk-crit: #ff1744;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: radial-gradient(circle at 50% 0%, #0c1c38 0%, var(--bg) 80%);
+      color: var(--text-main);
+      min-height: 100vh;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .container {
+      max-width: 1280px;
+      width: 100%;
+    }
+
+    /* Header */
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 24px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      backdrop-filter: blur(12px);
+      margin-bottom: 24px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .radar-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      border: 2px solid var(--accent);
+      position: relative;
+      overflow: hidden;
+      box-shadow: 0 0 12px var(--accent-glow);
+    }
+
+    .radar-icon::before {
+      content: '';
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      background: conic-gradient(from 0deg, transparent 60%, rgba(0, 229, 255, 0.5) 100%);
+      animation: sweep 2.5s linear infinite;
+    }
+
+    @keyframes sweep {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+
+    h1 {
+      font-size: 20px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+    }
+
+    .subtitle {
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      background: rgba(0, 230, 118, 0.12);
+      border: 1px solid rgba(0, 230, 118, 0.3);
+      border-radius: 30px;
+      color: #00e676;
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #00e676;
+      box-shadow: 0 0 8px #00e676;
+    }
+
+    /* Main Grid */
+    .grid {
+      display: grid;
+      grid-template-columns: 480px 1fr;
+      gap: 24px;
+    }
+
+    @media (max-width: 1024px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 24px;
+      backdrop-filter: blur(14px);
+    }
+
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+    }
+
+    .card-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: #b7c9e2;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* Upload & Input Controls */
+    .dropzone {
+      border: 2px dashed rgba(45, 114, 210, 0.4);
+      border-radius: 12px;
+      padding: 32px 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.25s ease;
+      background: rgba(10, 20, 36, 0.5);
+    }
+
+    .dropzone:hover, .dropzone.dragover {
+      border-color: var(--accent);
+      background: rgba(0, 229, 255, 0.05);
+      box-shadow: 0 0 20px rgba(0, 229, 255, 0.1);
+    }
+
+    .dropzone-icon {
+      font-size: 32px;
+      margin-bottom: 8px;
+      color: var(--accent);
+    }
+
+    .dropzone-hint {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-top: 6px;
+    }
+
+    .form-group {
+      margin-top: 16px;
+    }
+
+    .form-label {
+      font-size: 13px;
+      color: var(--text-muted);
+      display: block;
+      margin-bottom: 6px;
+    }
+
+    .input-field {
+      width: 100%;
+      background: rgba(7, 14, 26, 0.8);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      color: var(--text-main);
+      padding: 10px 14px;
+      font-size: 14px;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .input-field:focus {
+      border-color: var(--accent);
+    }
+
+    .btn {
+      width: 100%;
+      margin-top: 16px;
+      padding: 12px 20px;
+      border-radius: 10px;
+      border: none;
+      font-family: inherit;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.25s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #00b4d8 0%, #0077b6 100%);
+      color: #fff;
+      box-shadow: 0 4px 14px rgba(0, 180, 216, 0.3);
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 20px rgba(0, 180, 216, 0.45);
+    }
+
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    /* Annotated Preview */
+    .preview-container {
+      margin-top: 20px;
+      position: relative;
+      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid var(--card-border);
+      background: #000;
+      min-height: 240px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .preview-container img {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+
+    .preview-placeholder {
+      color: var(--text-muted);
+      font-size: 14px;
+      text-align: center;
+      padding: 20px;
+    }
+
+    .pill-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .pill {
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      background: rgba(45, 114, 210, 0.2);
+      border: 1px solid rgba(45, 114, 210, 0.4);
+      color: #c9dbf4;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* Report Section */
+    .metrics-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    @media (max-width: 640px) {
+      .metrics-row {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    .metric-card {
+      background: rgba(10, 20, 36, 0.6);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+
+    .metric-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+    }
+
+    .metric-value {
+      font-size: 20px;
+      font-weight: 700;
+      margin-top: 4px;
+      color: var(--text-main);
+    }
+
+    /* Threat Badges */
+    .threat-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    .threat-LOW {
+      background: rgba(0, 230, 118, 0.15);
+      border: 1px solid var(--risk-low);
+      color: var(--risk-low);
+    }
+
+    .threat-MEDIUM {
+      background: rgba(255, 179, 0, 0.15);
+      border: 1px solid var(--risk-med);
+      color: var(--risk-med);
+    }
+
+    .threat-HIGH {
+      background: rgba(255, 87, 34, 0.15);
+      border: 1px solid var(--risk-high);
+      color: var(--risk-high);
+    }
+
+    .threat-CRITICAL {
+      background: rgba(255, 23, 68, 0.2);
+      border: 1px solid var(--risk-crit);
+      color: var(--risk-crit);
+      animation: pulseCrit 1.8s infinite;
+    }
+
+    @keyframes pulseCrit {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 23, 68, 0.4); }
+      50% { box-shadow: 0 0 14px 2px rgba(255, 23, 68, 0.6); }
+    }
+
+    /* Actions Box */
+    .actions-box {
+      background: rgba(0, 229, 255, 0.05);
+      border: 1px solid rgba(0, 229, 255, 0.2);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 20px;
+    }
+
+    .actions-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--accent);
+      margin-bottom: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .action-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      font-size: 13.5px;
+      color: #d1e2f6;
+      margin-bottom: 8px;
+    }
+
+    .action-item:last-child {
+      margin-bottom: 0;
+    }
+
+    .action-bullet {
+      color: var(--accent);
+      font-weight: bold;
+    }
+
+    /* Markdown Report View */
+    .report-view {
+      background: rgba(6, 12, 22, 0.85);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 24px;
+      line-height: 1.65;
+      font-size: 14.5px;
+      color: #dbe7f6;
+      max-height: 520px;
+      overflow-y: auto;
+    }
+
+    .report-view h1 {
+      font-size: 20px;
+      color: #fff;
+      margin-bottom: 8px;
+      border-bottom: 1px solid var(--card-border);
+      padding-bottom: 8px;
+    }
+
+    .report-view h2 {
+      font-size: 16px;
+      color: var(--accent);
+      margin: 18px 0 8px 0;
+    }
+
+    .report-view p {
+      margin-bottom: 12px;
+    }
+
+    .report-view ul, .report-view ol {
+      margin-left: 20px;
+      margin-bottom: 12px;
+    }
+
+    .report-view strong {
+      color: #fff;
+    }
+
+    .btn-group {
+      display: flex;
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .btn-secondary {
+      background: rgba(45, 114, 210, 0.15);
+      border: 1px solid rgba(45, 114, 210, 0.4);
+      color: #bcd4f5;
+      font-size: 13px;
+      padding: 8px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .btn-secondary:hover {
+      background: rgba(45, 114, 210, 0.3);
+      color: #fff;
+    }
+
+    .spinner {
+      border: 3px solid rgba(255, 255, 255, 0.2);
+      border-top-color: #fff;
+      border-radius: 50%;
+      width: 18px;
+      height: 18px;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <div class="radar-icon"></div>
+        <div>
+          <h1>Sonar Debris & Anomaly Survey Console</h1>
+          <p class="subtitle">Acoustic Object Detection (YOLOv8) & Maritime Hazard Intelligence (Gemini)</p>
+        </div>
+      </div>
+      <div class="status-badge">
+        <span class="status-dot"></span>
+        <span>Sensor Core Online</span>
+      </div>
+    </header>
+
+    <div class="grid">
+      <!-- Left Column: Detection & Sonar Upload -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Acoustic Imagery Scan</span>
+        </div>
+
+        <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
+          <div class="dropzone-icon">⌖</div>
+          <p><strong>Click to browse</strong> or drag & drop sonar frame</p>
+          <p class="dropzone-hint">Supports JPEG, PNG forward-looking sonar captures</p>
+          <input type="file" id="fileInput" accept="image/*" style="display: none;" onchange="handleFileSelected(event)" />
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="locationInput">Survey Sector / Marine Coordinates</label>
+          <input class="input-field" id="locationInput" type="text" placeholder="e.g., Chennai Coastal Sector 4 (Depth: 28m)" value="Gulf Sector 7 - Coastal Approach" />
+        </div>
+
+        <button class="btn btn-primary" id="scanBtn" onclick="runDetection()" disabled>
+          <span>Run Acoustic Detection</span>
+        </button>
+
+        <div class="preview-container" id="previewBox">
+          <div class="preview-placeholder">Awaiting sonar image upload...</div>
+        </div>
+
+        <div id="detectionPills" class="pill-list"></div>
+      </div>
+
+      <!-- Right Column: Elaborated Gemini Report -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Survey Intelligence Report</span>
+          <div id="threatBadgeSlot">
+            <span class="threat-badge threat-LOW">AWAITING SCAN</span>
+          </div>
+        </div>
+
+        <!-- Metric Counters -->
+        <div class="metrics-row">
+          <div class="metric-card">
+            <div class="metric-label">Total Targets</div>
+            <div class="metric-value" id="metricTotal">--</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Confidence Avg</div>
+            <div class="metric-value" id="metricConf">--</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">High Priority</div>
+            <div class="metric-value" id="metricCritical">--</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Primary Hazard</div>
+            <div class="metric-value" style="font-size: 13px; font-weight: 500;" id="metricHazard">--</div>
+          </div>
+        </div>
+
+        <!-- Priority Action Items -->
+        <div class="actions-box" id="actionsBox" style="display: none;">
+          <div class="actions-title">Immediate Tactical Protocol</div>
+          <div id="actionItemsContainer"></div>
+        </div>
+
+        <!-- Full Report Markdown Renderer -->
+        <div class="report-view" id="reportView">
+          <em>Upload a sonar frame and execute detection to generate the elaborated acoustic survey report...</em>
+        </div>
+
+        <div class="btn-group">
+          <button class="btn-secondary" onclick="copyReport()">📋 Copy Report Markdown</button>
+          <button class="btn-secondary" onclick="window.print()">🖨️ Print / Save PDF</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let selectedFile = null;
+    let latestDetections = [];
+    let latestReportMarkdown = "";
+
+    // Drag and drop events
+    const dropzone = document.getElementById('dropzone');
+    ['dragenter', 'dragover'].forEach(name => {
+      dropzone.addEventListener(name, (e) => {
+        e.preventDefault();
+        dropzone.classList.add('dragover');
+      });
+    });
+    ['dragleave', 'drop'].forEach(name => {
+      dropzone.addEventListener(name, (e) => {
+        e.preventDefault();
+        dropzone.classList.remove('dragover');
+      });
+    });
+    dropzone.addEventListener('drop', (e) => {
+      if (e.dataTransfer.files.length) {
+        selectedFile = e.dataTransfer.files[0];
+        onFileLoaded();
+      }
+    });
+
+    function handleFileSelected(event) {
+      if (event.target.files.length) {
+        selectedFile = event.target.files[0];
+        onFileLoaded();
+      }
+    }
+
+    function onFileLoaded() {
+      document.getElementById('scanBtn').disabled = false;
+      dropzone.querySelector('p strong').innerText = selectedFile.name;
+    }
+
+    // Step 1: Detect
+    async function runDetection() {
+      if (!selectedFile) return;
+
+      const scanBtn = document.getElementById('scanBtn');
+      scanBtn.disabled = true;
+      scanBtn.innerHTML = '<span class="spinner"></span> <span>Analyzing Sonar Frame...</span>';
+
+      const formData = new FormData();
+      formData.append("file", selectedFile);
+
+      try {
+        const res = await fetch("/detect", {
+          method: "POST",
+          body: formData
+        });
+
+        if (!res.ok) throw new Error("Detection endpoint failed: " + res.statusText);
+        const data = await res.json();
+
+        latestDetections = data.detections || [];
+
+        // Render annotated image
+        const previewBox = document.getElementById('previewBox');
+        previewBox.innerHTML = `<img src="${data.annotated_image}" alt="Sonar Detections" />`;
+
+        // Render detection pills
+        const pillList = document.getElementById('detectionPills');
+        pillList.innerHTML = latestDetections.map(d => 
+          `<span class="pill">${d.class} (${Math.round(d.confidence * 100)}%)</span>`
+        ).join('') || '<span class="pill">No targets identified</span>';
+
+        // Step 2: Trigger Report Generation
+        await generateReport();
+
+      } catch (err) {
+        alert("Error during detection: " + err.message);
+      } finally {
+        scanBtn.disabled = false;
+        scanBtn.innerHTML = '<span>Run Acoustic Detection</span>';
+      }
+    }
+
+    // Step 2: Generate Report
+    async function generateReport() {
+      const reportView = document.getElementById('reportView');
+      reportView.innerHTML = '<div style="display:flex;align-items:center;gap:12px;padding:24px 0;"><span class="spinner"></span> <span>Synthesizing Oceanographic Survey & Hazard Assessment...</span></div>';
+
+      const locationNote = document.getElementById('locationInput').value;
+
+      try {
+        const res = await fetch("/report", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            detections: latestDetections,
+            location_note: locationNote
+          })
+        });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.detail || res.statusText);
+        }
+
+        const data = await res.json();
+        latestReportMarkdown = data.report_markdown || data.report;
+
+        // Render threat badge
+        const badgeSlot = document.getElementById('threatBadgeSlot');
+        badgeSlot.innerHTML = `<span class="threat-badge threat-${data.risk_level}">${data.risk_level} THREAT</span>`;
+
+        // Populate metrics
+        document.getElementById('metricTotal').innerText = data.statistics?.total_detections ?? latestDetections.length;
+        document.getElementById('metricConf').innerText = data.statistics?.avg_confidence ? `${Math.round(data.statistics.avg_confidence * 100)}%` : '--';
+        document.getElementById('metricCritical').innerText = (data.statistics?.categories?.critical_anomalies || 0) + (data.statistics?.categories?.subsea_hardware || 0);
+        document.getElementById('metricHazard').innerText = data.primary_hazard || 'None';
+
+        // Render immediate protocol actions
+        const actionsBox = document.getElementById('actionsBox');
+        const actionsContainer = document.getElementById('actionItemsContainer');
+        if (data.priority_actions && data.priority_actions.length) {
+          actionsBox.style.display = 'block';
+          actionsContainer.innerHTML = data.priority_actions.map((act, i) => `
+            <div class="action-item">
+              <span class="action-bullet">${i + 1}.</span>
+              <span>${act}</span>
+            </div>
+          `).join('');
+        } else {
+          actionsBox.style.display = 'none';
+        }
+
+        // Render Markdown content
+        reportView.innerHTML = marked.parse(latestReportMarkdown);
+
+      } catch (err) {
+        reportView.innerHTML = `<div style="color: #ff5252;"><strong>Failed to generate report:</strong><br>${err.message}</div>`;
+      }
+    }
+
+    function copyReport() {
+      if (!latestReportMarkdown) return;
+      navigator.clipboard.writeText(latestReportMarkdown).then(() => {
+        alert("Report markdown copied to clipboard!");
+      });
+    }
+  </script>
+</body>
+</html>
