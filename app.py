@@ -111,10 +111,10 @@ def root():
 # ENDPOINT 1: /detect
 # ---------------------------------------------------------------------------
 @app.post("/detect")
-async def detect(file: UploadFile = File(...), include_annotated: bool = True):
+async def detect(file: UploadFile = File(...)):
     """
-    Accepts an uploaded sonar image, runs YOLOv8 detection at 416px, returns raw detections
-    and an optional annotated image.
+    Accepts an uploaded sonar image, runs YOLOv8 detection at 416px,
+    and returns only the detected objects and bounding box telemetry.
     """
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
@@ -144,33 +144,17 @@ async def detect(file: UploadFile = File(...), include_annotated: bool = True):
         detections.append({
             "class": cls_name,
             "confidence": round(confidence, 3),
-            "box": {"x1": round(x1, 1), "y1": round(y1, 1), "x2": round(x2, 1), "y2": round(y2, 1)},
+            "box": {
+                "x1": round(x1, 1),
+                "y1": round(y1, 1),
+                "x2": round(x2, 1),
+                "y2": round(y2, 1)
+            },
             "area_percentage": area_pct
         })
 
-    annotated_data_url = None
-    if include_annotated:
-        # Generate annotated image only if requested (saving CPU and network overhead)
-        annotated_array = result.plot()
-        annotated_image = Image.fromarray(annotated_array[..., ::-1])
-
-        # Downscale annotated preview if larger than 800px
-        if annotated_image.width > 800:
-            ratio = 800.0 / annotated_image.width
-            new_size = (800, int(annotated_image.height * ratio))
-            annotated_image = annotated_image.resize(new_size, Image.Resampling.BILINEAR)
-
-        buffer = io.BytesIO()
-        annotated_image.save(buffer, format="JPEG", quality=75, optimize=True)
-        annotated_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-        annotated_data_url = f"data:image/jpeg;base64,{annotated_base64}"
-
     return {
-        "detections": detections,
-        "image_width": image.width,
-        "image_height": image.height,
-        "total_detected": len(detections),
-        "annotated_image": annotated_data_url
+        "detections": detections
     }
 
 

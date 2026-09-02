@@ -703,8 +703,7 @@
       formData.append("file", selectedFile);
 
       try {
-        // Request pure detections without server-side JPEG rendering overhead
-        const res = await fetch("/detect?include_annotated=false", {
+        const res = await fetch("/detect", {
           method: "POST",
           body: formData
         });
