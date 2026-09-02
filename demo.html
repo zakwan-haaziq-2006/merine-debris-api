@@ -648,12 +648,15 @@
           `<span class="pill">${d.class} (${Math.round(d.confidence * 100)}%)</span>`
         ).join('') || '<span class="pill">No targets identified</span>';
 
-        // Step 2: Trigger Report Generation
-        await generateReport();
+        // Re-enable scan button immediately so user sees detection completed right away
+        scanBtn.disabled = false;
+        scanBtn.innerHTML = '<span>Run Acoustic Detection</span>';
+
+        // Step 2: Trigger Report Generation asynchronously
+        generateReport();
 
       } catch (err) {
         alert("Error during detection: " + err.message);
-      } finally {
         scanBtn.disabled = false;
         scanBtn.innerHTML = '<span>Run Acoustic Detection</span>';
       }

@@ -58,14 +58,35 @@ app.add_middleware(
 # Load YOLO model
 model = YOLO(MODEL_PATH)
 
-# Supported generation models
-ACTIVE_GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-flash-latest"]
+import torch
+# Render free tier has 0.1 CPU core. Limiting to 1 thread eliminates massive thread contention.
+torch.set_num_threads(1)
+
+# Supported generation models (prioritizing ultra-fast low-latency models without thinking delays)
+ACTIVE_GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-latest",
+    "gemini-3.7-flash"
+]
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY, transport="rest")
-    gemini_model = genai.GenerativeModel("gemini-3.6-flash")
+    # Pre-initialize generative model
+    gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 else:
     gemini_model = None
+
+
+@app.on_event("startup")
+def warmup():
+    """Pre-warms YOLO model so the first user request is not delayed by PyTorch cold-start."""
+    try:
+        import numpy as np
+        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        model.predict(dummy, imgsz=640, verbose=False)
+    except Exception:
+        pass
 
 
 @app.get("/")
@@ -98,7 +119,8 @@ async def detect(file: UploadFile = File(...)):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image format")
 
-    results = model.predict(image, conf=CONFIDENCE_THRESHOLD, verbose=False)
+    # Use imgsz=640 for fast inference on low-CPU environments
+    results = model.predict(image, conf=CONFIDENCE_THRESHOLD, imgsz=640, verbose=False)
     result = results[0]
 
     detections = []
@@ -120,12 +142,18 @@ async def detect(file: UploadFile = File(...)):
             "area_percentage": area_pct
         })
 
-    # Generate annotated image (bounding boxes and labels drawn) as base64 JPEG
+    # Generate annotated image (bounding boxes and labels drawn) as optimized base64 JPEG
     annotated_array = result.plot()
     annotated_image = Image.fromarray(annotated_array[..., ::-1])
 
+    # Downscale annotated preview if larger than 900px to speed up network payload on free tier
+    if annotated_image.width > 900:
+        ratio = 900.0 / annotated_image.width
+        new_size = (900, int(annotated_image.height * ratio))
+        annotated_image = annotated_image.resize(new_size, Image.Resampling.BILINEAR)
+
     buffer = io.BytesIO()
-    annotated_image.save(buffer, format="JPEG", quality=90)
+    annotated_image.save(buffer, format="JPEG", quality=80, optimize=True)
     annotated_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
     annotated_data_url = f"data:image/jpeg;base64,{annotated_base64}"
 
@@ -305,21 +333,32 @@ Break down the detections by domain category:
 ## 4. Operational Remediation & Action Protocol
 Provide a numbered, prioritized action protocol for port authorities, coast guard, or salvage teams (e.g. Priority Level 1 immediate notices to mariners, ROV deployment, diver dispatch, targeted recovery crane operations).
 
-Keep the tone rigorous, technical, and actionable. Do NOT generate conversational filler or introductory greetings."""
+Keep the tone rigorous, technical, concise, and actionable (maximum 350-400 words total). Do NOT generate conversational filler or introductory greetings."""
 
     response = None
     last_err = None
-    for model_name in ACTIVE_GEMINI_MODELS:
+    gen_config = {"max_output_tokens": 1000, "temperature": 0.2}
+
+    # Try pre-initialized model first for minimal latency
+    if gemini_model:
         try:
-            m = genai.GenerativeModel(model_name)
-            response = m.generate_content(prompt)
-            if response and response.text:
-                break
+            response = gemini_model.generate_content(prompt, generation_config=gen_config)
         except Exception as e:
             last_err = e
-            continue
 
-    if response is None or not response.text:
+    # Fallback to alternative models if primary failed
+    if response is None or not getattr(response, "text", None):
+        for model_name in ACTIVE_GEMINI_MODELS:
+            try:
+                m = genai.GenerativeModel(model_name)
+                response = m.generate_content(prompt, generation_config=gen_config)
+                if response and response.text:
+                    break
+            except Exception as e:
+                last_err = e
+                continue
+
+    if response is None or not getattr(response, "text", None):
         raise HTTPException(status_code=500, detail=f"Gemini generation error: {str(last_err)}")
 
     report_markdown = response.text.strip()
