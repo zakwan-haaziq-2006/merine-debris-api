@@ -460,7 +460,7 @@ def run_zero_gpu_inference(pil_image):
 try:
     import gradio as gr
 
-    with gr.Blocks(title="Marine Debris & Sonar Anomaly Survey", ssr_mode=False) as demo:
+    with gr.Blocks(title="Marine Debris & Sonar Anomaly Survey") as demo:
         with gr.Tab("Survey Dashboard"):
             gr.HTML('<iframe src="/demo" style="width:100%; height:92vh; border:none; border-radius:12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);"></iframe>')
         with gr.Tab("Direct ZeroGPU Inference"):
@@ -473,15 +473,13 @@ try:
     # Attach all FastAPI routes (/detect, /report, /demo, /docs) to Gradio's app
     demo.app.include_router(app.router)
 except Exception as e:
+    print(f"[ERROR] Failed to initialize Gradio: {e}")
     demo = None
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     if demo is not None:
-        try:
-            demo.launch(server_name="0.0.0.0", server_port=port, ssr=False)
-        except TypeError:
-            demo.launch(server_name="0.0.0.0", server_port=port)
+        demo.launch(server_name="0.0.0.0", server_port=port)
     else:
         import uvicorn
         uvicorn.run(app, host="0.0.0.0", port=port)
