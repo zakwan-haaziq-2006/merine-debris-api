@@ -11,14 +11,21 @@ os.environ["YOLO_VERBOSE"] = "False"
 # Disable experimental Node.js SSR in Gradio
 os.environ["GRADIO_SSR_MODE"] = "False"
 
-# Hugging Face ZeroGPU compatibility anchor
+# Hugging Face ZeroGPU - must literally use @spaces.GPU for AST scanner
 try:
     import spaces
-    @spaces.GPU
-    def zero_gpu_anchor():
-        return True
-except Exception:
-    pass
+except ImportError:
+    class spaces:
+        @staticmethod
+        def GPU(func=None, **kwargs):
+            if func is None:
+                return lambda fn: fn
+            return func
+
+@spaces.GPU
+def zero_gpu_anchor():
+    """ZeroGPU anchor - required for Hugging Face ZeroGPU Spaces runtime."""
+    return True
 
 import threading
 
