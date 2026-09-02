@@ -1,37 +1,16 @@
 import os
-# Force 1 thread for all C++/OpenMP/NumPy/ONNX runtimes to eliminate thread-contention on 0.1 CPU
+
+# Keep thread counts low for constrained CPU environments (e.g. free-tier hosting)
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
-# Prevent runtime AutoUpdate which blocked container startup for 278 seconds
 os.environ["YOLO_AUTOUPDATE"] = "0"
 os.environ["YOLO_VERBOSE"] = "False"
-# Disable experimental Node.js SSR in Gradio
-os.environ["GRADIO_SSR_MODE"] = "False"
-
-# Hugging Face ZeroGPU - must literally use @spaces.GPU for AST scanner
-try:
-    import spaces
-except ImportError:
-    class spaces:
-        @staticmethod
-        def GPU(func=None, **kwargs):
-            if func is None:
-                return lambda fn: fn
-            return func
-
-@spaces.GPU
-def zero_gpu_anchor():
-    """ZeroGPU anchor - required for Hugging Face ZeroGPU Spaces runtime."""
-    return True
 
 import threading
-
 import io
-import base64
-import json
 import re
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -40,9 +19,8 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from ultralytics import YOLO
 from PIL import Image
-import google.generativeai as genai
 
-# ---- AUTO-LOAD .ENV IF PRESENT ----
+
 def _load_env_file():
     for candidate in [".env", "app/.env", os.path.join(os.path.dirname(__file__), ".env")]:
         if os.path.exists(candidate):
@@ -59,26 +37,24 @@ def _load_env_file():
             except Exception:
                 pass
 
+
 _load_env_file()
 
-# Prefer ultra-fast compiled ONNX model over PyTorch weights
 ONNX_PATH = os.path.join(os.path.dirname(__file__), "best.onnx")
 PT_PATH = os.path.join(os.path.dirname(__file__), "best.pt")
-MODEL_PATH = ONNX_PATH if os.path.exists(ONNX_PATH) else (PT_PATH if os.path.exists(PT_PATH) else "best.onnx")
+MODEL_PATH = ONNX_PATH if os.path.exists(ONNX_PATH) else (PT_PATH if os.path.exists(PT_PATH) else "best.pt")
 
 INFERENCE_SIZE = 416
 CONFIDENCE_THRESHOLD = 0.5
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Domain classification categories for the 13 sonar classes
 CRITICAL_ANOMALIES = {"human", "aircraft", "ship"}
 HARDWARE_AND_RIGGING = {"Chain", "Hook", "Propeller", "Valve"}
 CONSUMER_PLASTICS_WASTE = {"Bottle", "Can", "Drink-carton", "Shampoo-bottle", "Standing-bottle", "Tire"}
 
-# ---- SETUP ----
 app = FastAPI(
     title="Marine Debris & Sonar Anomaly Detection API",
-    description="Acoustic sonar object detection (YOLOv8 ONNX) and AI-powered survey analysis (Gemini)",
+    description="Acoustic sonar object detection (YOLOv8) and AI-powered survey analysis (Gemini)",
     version="2.1.0"
 )
 
@@ -89,33 +65,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load YOLO model (supports both .onnx and .pt)
 model = YOLO(MODEL_PATH)
 
 import torch
-# Render free tier has 0.1 CPU core. Limiting to 1 thread eliminates massive thread contention.
 torch.set_num_threads(1)
 
-# LangChain Gemini Setup
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-
+langchain_llm = None
 if GEMINI_API_KEY:
-    langchain_llm = ChatGoogleGenerativeAI(
-        model="gemini-3.6-flash",
-        google_api_key=GEMINI_API_KEY,
-        max_output_tokens=800,
-        max_retries=0,
-        timeout=10
-    )
-else:
-    langchain_llm = None
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        langchain_llm = ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash",
+            google_api_key=GEMINI_API_KEY,
+            max_output_tokens=800,
+            max_retries=0,
+            timeout=10
+        )
+    except Exception as e:
+        print(f"[WARN] Gemini setup failed: {e}")
+        langchain_llm = None
 
 
 @app.on_event("startup")
 def warmup():
-    """Warms up ONNX in a background daemon thread so Uvicorn binds immediately and passes health checks."""
     def _run_warmup():
         try:
             import numpy as np
@@ -135,20 +107,12 @@ def root():
         "model_format": "ONNX" if MODEL_PATH.endswith(".onnx") else "PyTorch",
         "inference_size": INFERENCE_SIZE,
         "gemini_configured": langchain_llm is not None,
-        "docs_url": "/docs",
-        "demo_url": "/demo"
+        "docs_url": "/docs"
     }
 
 
-# ---------------------------------------------------------------------------
-# ENDPOINT 1: /detect
-# ---------------------------------------------------------------------------
 @app.post("/detect")
 async def detect(file: UploadFile = File(...)):
-    """
-    Accepts an uploaded sonar image, runs YOLOv8 detection at 416px,
-    and returns only the detected objects and bounding box telemetry.
-    """
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
@@ -158,7 +122,6 @@ async def detect(file: UploadFile = File(...)):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image format")
 
-    # Fast inference at 416px on CPU (ONNX optimized)
     results = model.predict(image, conf=CONFIDENCE_THRESHOLD, imgsz=INFERENCE_SIZE, device="cpu", verbose=False)
     result = results[0]
 
@@ -168,8 +131,7 @@ async def detect(file: UploadFile = File(...)):
         cls_name = model.names[cls_id]
         confidence = float(box.conf[0])
         x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
-        
-        # Calculate relative bounding box area percentage
+
         box_area = (x2 - x1) * (y2 - y1)
         total_area = image.width * image.height
         area_pct = round((box_area / total_area) * 100, 2) if total_area > 0 else 0
@@ -186,18 +148,13 @@ async def detect(file: UploadFile = File(...)):
             "area_percentage": area_pct
         })
 
-    return {
-        "detections": detections
-    }
+    return {"detections": detections}
 
 
-# ---------------------------------------------------------------------------
-# ENDPOINT 2: /report
-# ---------------------------------------------------------------------------
 class SurveyMetadata(BaseModel):
     survey_id: str | None = None
     water_depth_m: float | None = None
-    sensor_type: str | None = "Forward-Looking Sonar (FLS)"
+    sensor_type: str | None = "Side-Scan / Forward-Looking Sonar"
     coordinates: str | None = None
 
 
@@ -208,7 +165,6 @@ class ReportRequest(BaseModel):
 
 
 def _aggregate_survey_telemetry(detections: list):
-    """Computes statistical and domain distribution metrics from raw detections."""
     total = len(detections)
     if total == 0:
         return None
@@ -234,7 +190,6 @@ def _aggregate_survey_telemetry(detections: list):
 
     avg_conf = round(sum(confidences) / total, 3) if confidences else 0.0
 
-    # Determine baseline risk classification
     if "human" in class_counts:
         risk_level = "CRITICAL"
         primary_hazard = "Human / Diver in Distress (Immediate SAR Protocol)"
@@ -267,31 +222,23 @@ def _aggregate_survey_telemetry(detections: list):
 
 @app.post("/report")
 async def generate_report(request: ReportRequest):
-    """
-    Takes detection telemetry from /detect and generates an elaborated,
-    highly accurate, professional maritime survey report using Gemini / LangChain.
-    """
     telemetry = _aggregate_survey_telemetry(request.detections)
     location_text = request.location_note or "General Coastal Survey Zone"
     meta_info = request.metadata or SurveyMetadata()
 
     if not telemetry:
         clean_report = f"""# Acoustic Sonar Survey Report
-**Location**: {location_text}  
-**Status**: CLEAR / NO TARGETS DETECTED  
-**Threat Level**: LOW  
+**Location**: {location_text}
+**Status**: CLEAR / NO TARGETS DETECTED
+**Threat Level**: LOW
 
 ### 1. Survey Overview
-Acoustic inspection of the specified survey sector returned zero high-confidence debris targets or seabed anomalies. 
+Acoustic inspection of the specified survey sector returned zero high-confidence debris targets or seabed anomalies.
 
-### 2. Acoustic Analysis
-The seabed profile shows continuous natural acoustic backscatter without man-made acoustic shadows, metallic reflections, or synthetic debris silhouettes.
-
-### 3. Conclusion & Recommendation
-No navigational or environmental hazards detected. Normal maritime transit and benthic habitat operations may continue without intervention."""
+### 2. Conclusion & Recommendation
+No navigational or environmental hazards detected. Normal maritime transit may continue without intervention."""
         return {
             "report": clean_report,
-            "report_markdown": clean_report,
             "risk_level": "LOW",
             "summary": "Survey clear: No marine debris or acoustic anomalies detected.",
             "primary_hazard": "None",
@@ -303,120 +250,76 @@ No navigational or environmental hazards detected. Normal maritime transit and b
             "priority_actions": ["Log sector as clear in maritime registry", "Proceed with routine monitoring schedule"]
         }
 
-    # Format telemetry breakdown for Gemini prompt
-    item_lines = [
-        f"  - {count}x '{cls}'"
-        for cls, count in telemetry["class_counts"].items()
-    ]
+    item_lines = [f"  - {count}x '{cls}'" for cls, count in telemetry["class_counts"].items()]
     detections_summary = "\n".join(item_lines)
 
-    # Elaborated domain prompt
-    prompt = f"""You are a Lead Marine Acoustic Surveyor and Oceanographic Environmental Officer conducting subsea survey evaluations using Forward-Looking Sonar (FLS) imagery.
+    prompt = f"""You are a Lead Marine Acoustic Surveyor conducting subsea survey evaluations using sonar imagery.
 
-Provide an elaborated, technically accurate, and highly professional Marine Survey & Hazard Assessment Report based strictly on the verified acoustic detections below.
+Provide a technically accurate, professional Marine Survey & Hazard Assessment Report based strictly on the verified acoustic detections below.
 
-=== MISSION & SENSOR TELEMETRY ===
-- Location/Sector: {location_text}
-- Sensor Type: {meta_info.sensor_type}
-- Total Detected Objects: {telemetry["total_detections"]}
-- Average Acoustic Confidence: {int(telemetry["avg_confidence"] * 100)}%
-- Target Breakdown:
+Location/Sector: {location_text}
+Sensor Type: {meta_info.sensor_type}
+Total Detected Objects: {telemetry["total_detections"]}
+Average Acoustic Confidence: {int(telemetry["avg_confidence"] * 100)}%
+Target Breakdown:
 {detections_summary}
-- Categorical Distribution:
-  * High-Consequence Anomalies: {telemetry["categories"]["critical_anomalies"]}
-  * Subsea Rigging / Hardware: {telemetry["categories"]["subsea_hardware"]}
-  * Synthetic Polymers & General Waste: {telemetry["categories"]["plastics_and_debris"]}
-- Preliminary Baseline Risk Rating: {telemetry["risk_level"]} ({telemetry["primary_hazard"]})
+Preliminary Baseline Risk Rating: {telemetry["risk_level"]} ({telemetry["primary_hazard"]})
 
-=== REPORT REQUIREMENTS ===
-Generate a comprehensive, structured technical survey document in professional GitHub-Flavored Markdown. 
-Structure the report into the following exact sections:
-
+Write a structured markdown report with these sections:
 # Marine Sonar Survey & Environmental Hazard Assessment
-**Sector**: {location_text} | **Sensor**: {meta_info.sensor_type}  
-**Assessment Risk Level**: [{telemetry["risk_level"]}]
-
 ## 1. Executive Summary
-Provide an authoritative 2-3 paragraph operational synthesis. Summarize the acoustic scan, describe the concentration and nature of target returns, and state the immediate operational posture required.
-
 ## 2. Acoustic Target Inventory & Classification
-Break down the detections by domain category:
-- **Maritime Anomalies & Structural Wreckage** (e.g. aircraft, ship, human): Discuss dimensions, structural integrity, potential historical/salvage significance, or urgent SAR (Search and Rescue) considerations.
-- **Subsea Machinery & Heavy Hardware** (e.g. chain, propeller, hook, valve): Discuss snag/entanglement hazards to submarine cables, commercial bottom-trawling nets, and vessel propulsion systems.
-- **Anthropogenic Debris & Polymers** (e.g. tires, bottles, cartons, cans): Assess benthic smothering, chemical leaching, microplastic degradation timelines, and marine fauna toxicity.
-
 ## 3. Threat Assessment & Navigational Impact
-- **Hydrodynamic & Navigational Risks**: Evaluate water column clearance, shallow hazards to shallow-draft vessels, diver safety, and ROV navigation.
-- **Ecosystem & Benthic Toxicity**: Detail the ecological fallout if targets remain unrecovered.
-
 ## 4. Operational Remediation & Action Protocol
-Provide a numbered, prioritized action protocol for port authorities, coast guard, or salvage teams (e.g. Priority Level 1 immediate notices to mariners, ROV deployment, diver dispatch, targeted recovery crane operations).
 
-Keep the tone rigorous, technical, concise, and actionable (maximum 350-400 words total). Do NOT generate conversational filler or introductory greetings."""
+Keep it rigorous, technical, and actionable (max 350 words). No conversational filler."""
 
     report_markdown = None
-
-    # Attempt LangChain Gemini generation if configured
     if langchain_llm is not None:
         try:
-            prompt_template = PromptTemplate.from_template("{prompt_text}")
-            chain = prompt_template | langchain_llm | StrOutputParser()
-            res = await chain.ainvoke({"prompt_text": prompt})
-            if res and res.strip():
-                report_markdown = res.strip()
+            res = await langchain_llm.ainvoke(prompt)
+            text = res.content if hasattr(res, "content") else str(res)
+            if text and text.strip():
+                report_markdown = text.strip()
         except Exception as e:
-            # When Gemini hits quota (429) or is unreachable, gracefully fall back to telemetry report
-            print(f"[WARN] Gemini report generation failed ({e}). Using telemetry-based acoustic survey report.")
+            print(f"[WARN] Gemini report generation failed ({e}). Using fallback report.")
 
-    # High-reliability fallback report (ensures /report NEVER crashes with 500 error)
     if not report_markdown:
         report_markdown = f"""# Marine Sonar Survey & Environmental Hazard Assessment
-**Sector**: {location_text} | **Sensor**: {meta_info.sensor_type}  
+**Sector**: {location_text} | **Sensor**: {meta_info.sensor_type}
 **Assessment Risk Level**: [{telemetry["risk_level"]}]
 
 ## 1. Executive Summary
-Acoustic sonar survey across {location_text} identified a total of {telemetry["total_detections"]} target return(s) with an average acoustic confidence of {int(telemetry["avg_confidence"] * 100)}%. Preliminary hazard rating is classified as {telemetry["risk_level"]} due to {telemetry["primary_hazard"]}.
+Acoustic sonar survey across {location_text} identified {telemetry["total_detections"]} target return(s) with average confidence {int(telemetry["avg_confidence"] * 100)}%. Preliminary hazard rating: {telemetry["risk_level"]} due to {telemetry["primary_hazard"]}.
 
 ## 2. Acoustic Target Inventory & Classification
-Target breakdown:
 {detections_summary}
 
-- **Critical Maritime Anomalies**: {telemetry["categories"]["critical_anomalies"]} target(s) logged.
-- **Subsea Rigging & Hardware**: {telemetry["categories"]["subsea_hardware"]} target(s) logged.
-- **Anthropogenic Waste & Polymers**: {telemetry["categories"]["plastics_and_debris"]} target(s) logged.
-
 ## 3. Threat Assessment & Navigational Impact
-- **Primary Hazard**: {telemetry["primary_hazard"]}
-- **Navigational Impact**: Subsea debris poses entanglement and snag risks to vessel propulsion systems, commercial nets, and underwater infrastructure. Immediate caution advised for local maritime traffic.
+Primary Hazard: {telemetry["primary_hazard"]}. Subsea debris poses entanglement and snag risk to vessels and equipment.
 
 ## 4. Operational Remediation & Action Protocol
-1. Transmit acoustic hazard bulletin to harbor master and coastal patrol ({location_text}).
-2. Deploy Remotely Operated Vehicle (ROV) for optical inspection and target coordinates confirmation.
-3. Schedule targeted mechanical recovery operations for identified heavy subsea targets."""
+1. Transmit hazard bulletin to harbor master and coastal patrol ({location_text}).
+2. Deploy ROV for visual confirmation.
+3. Schedule mechanical recovery for identified heavy targets."""
 
-    # Extract 2-line executive summary from the markdown text
     summary_match = re.search(r"## 1\. Executive Summary\s+([^\n#]+)", report_markdown)
-    exec_summary = summary_match.group(1).strip() if summary_match else f"Identified {telemetry['total_detections']} objects across survey sector {location_text} with baseline risk rating {telemetry['risk_level']}."
+    exec_summary = summary_match.group(1).strip() if summary_match else f"Identified {telemetry['total_detections']} objects in {location_text}, risk: {telemetry['risk_level']}."
 
-    # Extract priority actions if available
     actions = []
-    actions_section = re.search(r"## 4\. Operational Remediation & Action Protocol\s+([\s\S]*?)(?:$|#)", report_markdown)
+    actions_section = re.search(r"## 4\..*?\n([\s\S]*?)(?:$|#)", report_markdown)
     if actions_section:
         raw_actions = re.findall(r"(?:^|\n)\s*(?:\d+\.|\-|\*)\s*(.+)", actions_section.group(1))
         actions = [a.strip() for a in raw_actions[:5] if a.strip()]
     if not actions:
         actions = [
-            f"Transmit hazard bulletin to local harbor master and coastal patrol ({location_text})",
-            "Deploy Remotely Operated Vehicle (ROV) for high-resolution visual confirmation",
-            "Schedule mechanical salvage operation for heavy entanglement risks"
+            f"Transmit hazard bulletin to harbor master ({location_text})",
+            "Deploy ROV for visual confirmation",
+            "Schedule mechanical recovery for heavy targets"
         ]
 
     return {
-        # Backward compatibility field:
         "report": report_markdown,
-        
-        # Enriched structured fields:
-        "report_markdown": report_markdown,
         "risk_level": telemetry["risk_level"],
         "summary": exec_summary,
         "primary_hazard": telemetry["primary_hazard"],
@@ -430,56 +333,16 @@ Target breakdown:
     }
 
 
-# ---------------------------------------------------------------------------
-# INTERACTIVE DEMO / TEST UI (for frontend preview and verification)
-# ---------------------------------------------------------------------------
 @app.get("/demo", response_class=HTMLResponse)
 def demo_interface():
-    """Provides a built-in modern dashboard to test /detect and /report interactively."""
     html_file = os.path.join(os.path.dirname(__file__), "demo.html")
     if os.path.exists(html_file):
         with open(html_file, "r", encoding="utf-8") as f:
             return f.read()
-    return "<h1>Demo dashboard template not found</h1>"
+    return "<h1>No demo.html found. /docs is available for testing the API directly.</h1>"
 
-
-# ---------------------------------------------------------------------------
-# HUGGING FACE SPACES / GRADIO LAUNCHER (ZeroGPU Compatible)
-# ---------------------------------------------------------------------------
-@spaces.GPU
-def run_zero_gpu_inference(pil_image):
-    """ZeroGPU event handler - satisfies Hugging Face ZeroGPU registration and executes on GPU."""
-    if pil_image is None:
-        return None
-    try:
-        results = model.predict(pil_image, imgsz=INFERENCE_SIZE, conf=0.25, verbose=False)
-        return results[0].plot()
-    except Exception as e:
-        return None
-
-try:
-    import gradio as gr
-
-    with gr.Blocks(title="Marine Debris & Sonar Anomaly Survey") as demo:
-        with gr.Tab("Survey Dashboard"):
-            gr.HTML('<iframe src="/demo" style="width:100%; height:92vh; border:none; border-radius:12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);"></iframe>')
-        with gr.Tab("Direct ZeroGPU Inference"):
-            with gr.Row():
-                inp = gr.Image(type="pil", label="Upload Sonar Acoustic Image")
-                out = gr.Image(type="numpy", label="Detection Overlay")
-            btn = gr.Button("Detect Targets (ZeroGPU Accelerated)", variant="primary")
-            btn.click(fn=run_zero_gpu_inference, inputs=inp, outputs=out)
-
-    # Attach all FastAPI routes (/detect, /report, /demo, /docs) to Gradio's app
-    demo.app.include_router(app.router)
-except Exception as e:
-    print(f"[ERROR] Failed to initialize Gradio: {e}")
-    demo = None
 
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.environ.get("PORT", 7860))
-    if demo is not None:
-        demo.launch(server_name="0.0.0.0", server_port=port)
-    else:
-        import uvicorn
-        uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
