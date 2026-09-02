@@ -1,4 +1,11 @@
 import os
+# Force 1 thread for all C++/OpenMP/NumPy/ONNX runtimes to eliminate thread-contention on 0.1 CPU
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import io
 import base64
 import json
@@ -87,6 +94,7 @@ def warmup():
     try:
         import numpy as np
         dummy = np.zeros((INFERENCE_SIZE, INFERENCE_SIZE, 3), dtype=np.uint8)
+        model.predict(dummy, imgsz=INFERENCE_SIZE, device="cpu", verbose=False)
         model.predict(dummy, imgsz=INFERENCE_SIZE, device="cpu", verbose=False)
     except Exception:
         pass
