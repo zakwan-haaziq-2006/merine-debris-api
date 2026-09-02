@@ -444,13 +444,31 @@ def demo_interface():
 
 
 # ---------------------------------------------------------------------------
-# HUGGING FACE SPACES / GRADIO LAUNCHER
+# HUGGING FACE SPACES / GRADIO LAUNCHER (ZeroGPU Compatible)
 # ---------------------------------------------------------------------------
+@spaces.GPU
+def run_zero_gpu_inference(pil_image):
+    """ZeroGPU event handler - satisfies Hugging Face ZeroGPU registration and executes on GPU."""
+    if pil_image is None:
+        return None
+    try:
+        results = model.predict(pil_image, imgsz=INFERENCE_SIZE, conf=0.25, verbose=False)
+        return results[0].plot()
+    except Exception as e:
+        return None
+
 try:
     import gradio as gr
 
     with gr.Blocks(title="Marine Debris & Sonar Anomaly Survey", ssr_mode=False) as demo:
-        gr.HTML('<iframe src="/demo" style="width:100%; height:94vh; border:none; border-radius:12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);"></iframe>')
+        with gr.Tab("Survey Dashboard"):
+            gr.HTML('<iframe src="/demo" style="width:100%; height:92vh; border:none; border-radius:12px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);"></iframe>')
+        with gr.Tab("Direct ZeroGPU Inference"):
+            with gr.Row():
+                inp = gr.Image(type="pil", label="Upload Sonar Acoustic Image")
+                out = gr.Image(type="numpy", label="Detection Overlay")
+            btn = gr.Button("Detect Targets (ZeroGPU Accelerated)", variant="primary")
+            btn.click(fn=run_zero_gpu_inference, inputs=inp, outputs=out)
 
     # Attach all FastAPI routes (/detect, /report, /demo, /docs) to Gradio's app
     demo.app.include_router(app.router)
