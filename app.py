@@ -5,6 +5,11 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
+# Prevent runtime AutoUpdate which blocked container startup for 278 seconds
+os.environ["YOLO_AUTOUPDATE"] = "0"
+os.environ["YOLO_VERBOSE"] = "False"
+
+import threading
 
 import io
 import base64
@@ -92,14 +97,15 @@ else:
 
 @app.on_event("startup")
 def warmup():
-    """Pre-warms YOLO model so the first user request is not delayed by cold-start."""
-    try:
-        import numpy as np
-        dummy = np.zeros((INFERENCE_SIZE, INFERENCE_SIZE, 3), dtype=np.uint8)
-        model.predict(dummy, imgsz=INFERENCE_SIZE, device="cpu", verbose=False)
-        model.predict(dummy, imgsz=INFERENCE_SIZE, device="cpu", verbose=False)
-    except Exception:
-        pass
+    """Warms up ONNX in a background daemon thread so Uvicorn binds immediately and passes health checks."""
+    def _run_warmup():
+        try:
+            import numpy as np
+            dummy = np.zeros((INFERENCE_SIZE, INFERENCE_SIZE, 3), dtype=np.uint8)
+            model.predict(dummy, imgsz=INFERENCE_SIZE, device="cpu", verbose=False)
+        except Exception:
+            pass
+    threading.Thread(target=_run_warmup, daemon=True).start()
 
 
 @app.get("/")
