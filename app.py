@@ -66,20 +66,19 @@ import torch
 # Render free tier has 0.1 CPU core. Limiting to 1 thread eliminates massive thread contention.
 torch.set_num_threads(1)
 
-# Supported generation models (prioritizing ultra-fast low-latency models without thinking delays)
-ACTIVE_GEMINI_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-flash-latest",
-    "gemini-3.7-flash"
-]
+# LangChain Gemini Setup
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY, transport="rest")
-    # Pre-initialize generative model
-    gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+    langchain_llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=GEMINI_API_KEY,
+        max_output_tokens=800
+    )
 else:
-    gemini_model = None
+    langchain_llm = None
 
 
 @app.on_event("startup")
@@ -327,33 +326,17 @@ Provide a numbered, prioritized action protocol for port authorities, coast guar
 
 Keep the tone rigorous, technical, concise, and actionable (maximum 350-400 words total). Do NOT generate conversational filler or introductory greetings."""
 
-    response = None
-    last_err = None
-    gen_config = {"max_output_tokens": 1000, "temperature": 0.2}
+    if langchain_llm is None:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured.")
 
-    # Try pre-initialized model first for minimal latency
-    if gemini_model:
-        try:
-            response = gemini_model.generate_content(prompt, generation_config=gen_config)
-        except Exception as e:
-            last_err = e
+    prompt_template = PromptTemplate.from_template("{prompt_text}")
+    chain = prompt_template | langchain_llm | StrOutputParser()
 
-    # Fallback to alternative models if primary failed
-    if response is None or not getattr(response, "text", None):
-        for model_name in ACTIVE_GEMINI_MODELS:
-            try:
-                m = genai.GenerativeModel(model_name)
-                response = m.generate_content(prompt, generation_config=gen_config)
-                if response and response.text:
-                    break
-            except Exception as e:
-                last_err = e
-                continue
-
-    if response is None or not getattr(response, "text", None):
-        raise HTTPException(status_code=500, detail=f"Gemini generation error: {str(last_err)}")
-
-    report_markdown = response.text.strip()
+    try:
+        report_markdown = await chain.ainvoke({"prompt_text": prompt})
+        report_markdown = report_markdown.strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LangChain Gemini generation error: {str(e)}")
 
     # Extract 2-line executive summary from the markdown text
     summary_match = re.search(r"## 1\. Executive Summary\s+([^\n#]+)", report_markdown)
