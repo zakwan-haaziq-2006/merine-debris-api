@@ -422,4 +422,25 @@ def demo_interface():
     if os.path.exists(html_file):
         with open(html_file, "r", encoding="utf-8") as f:
             return f.read()
-    return "<h1>Demo dashboard template not found</h1>"
+    return "<h1>Demo dashboard template not found</h1>"
+
+
+# ---------------------------------------------------------------------------
+# HUGGING FACE SPACES / GRADIO COMPATIBILITY
+# ---------------------------------------------------------------------------
+try:
+    import gradio as gr
+    html_file = os.path.join(os.path.dirname(__file__), "demo.html")
+    dash_html = open(html_file, "r", encoding="utf-8").read() if os.path.exists(html_file) else "<h1>Marine Debris API</h1>"
+
+    with gr.Blocks(title="Marine Debris API") as gradio_ui:
+        gr.HTML(dash_html)
+
+    app = gr.mount_gradio_app(app, gradio_ui, path="/gradio")
+except Exception as e:
+    pass
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 7860))
+    uvicorn.run(app, host="0.0.0.0", port=port)
