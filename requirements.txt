@@ -6,3 +6,5 @@ pillow
 langchain-google-genai
 pydantic
 torch
+bcrypt
+pyjwt
