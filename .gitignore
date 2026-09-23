@@ -12,5 +12,7 @@ venv/
 env/
 
 # OS specific
-.DS_Store
-Thumbs.db
+# SQLite Database
+*.db
+users.db
+

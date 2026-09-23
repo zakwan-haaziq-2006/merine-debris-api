@@ -12,13 +12,148 @@ os.environ["YOLO_VERBOSE"] = "False"
 import threading
 import io
 import re
+import base64
+import sqlite3
+import datetime
+import bcrypt
+import jwt
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from ultralytics import YOLO
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
+
+DB_PATH = os.path.join(os.path.dirname(__file__), "users.db")
+JWT_SECRET = os.environ.get("JWT_SECRET", "deepsea_marine_sonar_sec_key_2026_9981")
+JWT_ALGORITHM = "HS256"
+
+
+def _init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            full_name TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+_init_db()
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def create_access_token(email: str, full_name: str) -> str:
+    payload = {
+        "sub": email,
+        "name": full_name,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=7)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def get_current_user(authorization: str | None = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authentication token required")
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        email = payload.get("sub")
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid token identity")
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, email, full_name, created_at FROM users WHERE email = ?", (email.lower().strip(),))
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            raise HTTPException(status_code=401, detail="User account not found")
+
+        return {
+            "id": row[0],
+            "email": row[1],
+            "full_name": row[2],
+            "created_at": row[3]
+        }
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Session expired, please sign in again")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid authorization token")
+
+
+class UserSignupRequest(BaseModel):
+    email: str
+    password: str
+    full_name: str | None = "Marine Surveyor"
+
+
+class UserLoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+
+def _crop_and_enhance_target(image: Image.Image, box: dict, scale: float = 3.0) -> dict:
+    """
+    Crops the bounding box from the sonar image, scales up by 3x,
+    and applies classical contrast enhancement, noise reduction, and sharpening.
+    Returns Base64 data URIs for raw_crop and enhanced_crop.
+    """
+    try:
+        w, h = image.width, image.height
+        x1 = max(0, min(w, int(box["x1"])))
+        y1 = max(0, min(h, int(box["y1"])))
+        x2 = max(0, min(w, int(box["x2"])))
+        y2 = max(0, min(h, int(box["y2"])))
+
+        if (x2 - x1) < 2 or (y2 - y1) < 2:
+            return {"raw_crop": None, "enhanced_crop": None}
+
+        crop = image.crop((x1, y1, x2, y2))
+
+        # Base64 Raw Crop
+        buf_raw = io.BytesIO()
+        crop.save(buf_raw, format="PNG")
+        raw_b64 = "data:image/png;base64," + base64.b64encode(buf_raw.getvalue()).decode("utf-8")
+
+        # 3x Lanczos Upscale
+        new_w = max(30, int(crop.width * scale))
+        new_h = max(30, int(crop.height * scale))
+        upscaled = crop.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+        # Classical Speckle Denoise (Median filter) + Contrast & Sharpness Boost
+        denoised = upscaled.filter(ImageFilter.MedianFilter(size=3))
+        enhanced = ImageEnhance.Contrast(denoised).enhance(1.65)
+        enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.8)
+
+        buf_enh = io.BytesIO()
+        enhanced.save(buf_enh, format="PNG")
+        enh_b64 = "data:image/png;base64," + base64.b64encode(buf_enh.getvalue()).decode("utf-8")
+
+        return {"raw_crop": raw_b64, "enhanced_crop": enh_b64}
+    except Exception as e:
+        print(f"[WARN] Failed to crop and enhance box {box}: {e}")
+        return {"raw_crop": None, "enhanced_crop": None}
+
 
 
 def _load_env_file():
@@ -42,7 +177,7 @@ _load_env_file()
 
 ONNX_PATH = os.path.join(os.path.dirname(__file__), "best.onnx")
 PT_PATH = os.path.join(os.path.dirname(__file__), "best.pt")
-MODEL_PATH = ONNX_PATH if os.path.exists(ONNX_PATH) else (PT_PATH if os.path.exists(PT_PATH) else "best.pt")
+MODEL_PATH = ONNX_PATH if os.path.exists(ONNX_PATH) else PT_PATH
 
 INFERENCE_SIZE = 416
 CONFIDENCE_THRESHOLD = 0.5
@@ -51,6 +186,50 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 CRITICAL_ANOMALIES = {"human", "aircraft", "ship"}
 HARDWARE_AND_RIGGING = {"Chain", "Hook", "Propeller", "Valve"}
 CONSUMER_PLASTICS_WASTE = {"Bottle", "Can", "Drink-carton", "Shampoo-bottle", "Standing-bottle", "Tire"}
+
+
+def calculate_priority_score(detection: dict):
+    """
+    Calculates a numeric priority score (0-100) and priority label for a single detection.
+    Factors & Weights (Total max = 100):
+      1. Category weight (max 50 pts): Critical anomalies (50) > Hardware/Rigging (30) > Plastics/Waste (15) > Other (10)
+      2. Confidence weight (max 30 pts): confidence * 30 (higher confidence = more trust in detection)
+      3. Size weight (max 20 pts): min(area_percentage * 2, 20) (larger objects = greater potential hazard)
+    
+    Priority Labels:
+      >= 75.0: URGENT
+      >= 50.0: HIGH
+      >= 30.0: MEDIUM
+      < 30.0 : LOW
+    """
+    cls = detection.get("class", "")
+    confidence = float(detection.get("confidence", 0.0))
+    area_pct = float(detection.get("area_percentage", 0.0))
+
+    if cls in CRITICAL_ANOMALIES:
+        cat_score = 50.0
+    elif cls in HARDWARE_AND_RIGGING:
+        cat_score = 30.0
+    elif cls in CONSUMER_PLASTICS_WASTE:
+        cat_score = 15.0
+    else:
+        cat_score = 10.0
+
+    conf_score = min(max(confidence, 0.0), 1.0) * 30.0
+    size_score = min(max(area_pct, 0.0) * 2.0, 20.0)
+
+    score = round(cat_score + conf_score + size_score, 1)
+
+    if score >= 75.0:
+        label = "URGENT"
+    elif score >= 50.0:
+        label = "HIGH"
+    elif score >= 30.0:
+        label = "MEDIUM"
+    else:
+        label = "LOW"
+
+    return score, label
 
 app = FastAPI(
     title="Marine Debris & Sonar Anomaly Detection API",
@@ -65,7 +244,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-model = YOLO(MODEL_PATH)
+model = None
+try:
+    model = YOLO(PT_PATH)
+except Exception as e:
+    print(f"[WARN] Failed to load primary model path '{MODEL_PATH}': {e}")
+    if MODEL_PATH != PT_PATH and os.path.exists(PT_PATH):
+        print(f"[INFO] Attempting fallback to PyTorch model weights '{PT_PATH}'...")
+        try:
+            model = YOLO(PT_PATH)
+        except Exception as pt_err:
+            raise RuntimeError(
+                f"Failed to load trained sonar model from both '{MODEL_PATH}' and '{PT_PATH}'. "
+                f"Error: {pt_err}"
+            ) from pt_err
+    else:
+        raise RuntimeError(
+            f"Failed to load trained sonar model from '{MODEL_PATH}'. "
+            f"Ensure 'best.onnx' or 'best.pt' exists and is valid. Error: {e}"
+        ) from e
 
 import torch
 torch.set_num_threads(1)
@@ -75,7 +272,7 @@ if GEMINI_API_KEY:
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
         langchain_llm = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
+            model="gemini-1.5-flash",
             google_api_key=GEMINI_API_KEY,
             max_output_tokens=800,
             max_retries=0,
@@ -136,7 +333,7 @@ async def detect(file: UploadFile = File(...)):
         total_area = image.width * image.height
         area_pct = round((box_area / total_area) * 100, 2) if total_area > 0 else 0
 
-        detections.append({
+        det = {
             "class": cls_name,
             "confidence": round(confidence, 3),
             "box": {
@@ -146,9 +343,23 @@ async def detect(file: UploadFile = File(...)):
                 "y2": round(y2, 1)
             },
             "area_percentage": area_pct
-        })
+        }
+        score, label = calculate_priority_score(det)
+        det["priority_score"] = score
+        det["priority_label"] = label
 
-    return {"detections": detections}
+        crops = _crop_and_enhance_target(image, det["box"])
+        det["raw_crop"] = crops.get("raw_crop")
+        det["enhanced_crop"] = crops.get("enhanced_crop")
+
+        detections.append(det)
+
+    return {
+        "detections": detections,
+        "image_width": image.width,
+        "image_height": image.height,
+        "total_detected": len(detections)
+    }
 
 
 class SurveyMetadata(BaseModel):
@@ -222,7 +433,33 @@ def _aggregate_survey_telemetry(detections: list):
 
 @app.post("/report")
 async def generate_report(request: ReportRequest):
-    telemetry = _aggregate_survey_telemetry(request.detections)
+    # Calculate priority score and label for all detections if not present, then sort descending
+    processed_detections = []
+    for d in request.detections:
+        det = dict(d)
+        if "priority_score" not in det or "priority_label" not in det:
+            score, label = calculate_priority_score(det)
+            det["priority_score"] = score
+            det["priority_label"] = label
+        processed_detections.append(det)
+
+    sorted_detections = sorted(
+        processed_detections,
+        key=lambda d: d.get("priority_score", 0.0),
+        reverse=True
+    )
+
+    top_priority_items = [
+        {
+            "class": d.get("class", "Unknown"),
+            "confidence": float(d.get("confidence", 0.0)),
+            "priority_score": float(d.get("priority_score", 0.0)),
+            "priority_label": d.get("priority_label", "LOW")
+        }
+        for d in sorted_detections[:3]
+    ]
+
+    telemetry = _aggregate_survey_telemetry(sorted_detections)
     location_text = request.location_note or "General Coastal Survey Zone"
     meta_info = request.metadata or SurveyMetadata()
 
@@ -242,6 +479,7 @@ No navigational or environmental hazards detected. Normal maritime transit may c
             "risk_level": "LOW",
             "summary": "Survey clear: No marine debris or acoustic anomalies detected.",
             "primary_hazard": "None",
+            "top_priority_items": [],
             "statistics": {
                 "total_detections": 0,
                 "avg_confidence": 1.0,
@@ -250,18 +488,22 @@ No navigational or environmental hazards detected. Normal maritime transit may c
             "priority_actions": ["Log sector as clear in maritime registry", "Proceed with routine monitoring schedule"]
         }
 
-    item_lines = [f"  - {count}x '{cls}'" for cls, count in telemetry["class_counts"].items()]
+    item_lines = [
+        f"  - [{d.get('priority_label', 'LOW')} | Priority Score: {d.get('priority_score', 0.0)}] '{d.get('class', 'Unknown')}' "
+        f"(Confidence: {int(float(d.get('confidence', 0.0)) * 100)}%, Area: {d.get('area_percentage', 0.0)}%)"
+        for d in sorted_detections
+    ]
     detections_summary = "\n".join(item_lines)
 
     prompt = f"""You are a Lead Marine Acoustic Surveyor conducting subsea survey evaluations using sonar imagery.
 
-Provide a technically accurate, professional Marine Survey & Hazard Assessment Report based strictly on the verified acoustic detections below.
+Provide a technically accurate, professional Marine Survey & Hazard Assessment Report based strictly on the verified acoustic detections below (listed in order of priority score descending).
 
 Location/Sector: {location_text}
 Sensor Type: {meta_info.sensor_type}
 Total Detected Objects: {telemetry["total_detections"]}
 Average Acoustic Confidence: {int(telemetry["avg_confidence"] * 100)}%
-Target Breakdown:
+Target Breakdown (Priority Descending):
 {detections_summary}
 Preliminary Baseline Risk Rating: {telemetry["risk_level"]} ({telemetry["primary_hazard"]})
 
@@ -323,6 +565,7 @@ Primary Hazard: {telemetry["primary_hazard"]}. Subsea debris poses entanglement 
         "risk_level": telemetry["risk_level"],
         "summary": exec_summary,
         "primary_hazard": telemetry["primary_hazard"],
+        "top_priority_items": top_priority_items,
         "statistics": {
             "total_detections": telemetry["total_detections"],
             "avg_confidence": telemetry["avg_confidence"],
